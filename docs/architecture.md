@@ -1,524 +1,202 @@
-# delivery-platform-distributed-system Architecture
+# Production Incident Scenarios
 
-## 1. Vision and Scope
-
-This project is an educational distributed systems platform that models operational failures in a large-scale food delivery system.
-
-The main business problem is **Pickup Conflict Resolution**.
-
-A real-world failure scenario:
-
-1. A customer places an order.
-2. The restaurant prepares the order.
-3. The platform assigns Driver A.
-4. Due to a race condition, delayed event, reassignment issue, or human error, another driver receives the order.
-5. Driver A arrives at the restaurant and discovers the order is already gone.
-6. Driver A loses time, fuel, and effort.
-7. Driver A reports the problem.
-8. The platform reconstructs what happened using distributed events.
-9. Support reviews the incident.
-10. If the driver is eligible, compensation is processed.
-11. The platform reaches a consistent final state.
-
-The goal is not to build a food delivery clone. The goal is to demonstrate how distributed systems handle:
-
-* inconsistent state
-* race conditions
-* operational failures
-* human decision workflows
-* compensation processes
-* eventual consistency
-
-## 2. Technical Goals
-
-Technologies:
-
-* Java 21
-* Spring Boot
-* Apache Kafka
-* PostgreSQL
-* Redis
-* Docker
-* Kubernetes
-* OpenTelemetry
-* Testcontainers
-
-Distributed systems patterns:
-
-* Event-driven architecture
-* Transactional Outbox Pattern
-* Saga Pattern
-* Idempotent consumers
-* Optimistic locking
-* Eventual consistency
-* Distributed tracing
-* Retry strategies
-* Dead Letter Queues
-* Reconciliation processes
-* Audit/event timeline reconstruction
+This project models production incidents commonly encountered in large-scale distributed systems. Each scenario demonstrates how failures are detected, investigated, and resolved while maintaining eventual consistency.
 
 ---
 
-# 3. Microservices and Bounded Contexts
+## Incident 1: Duplicate Driver Assignment
 
-The initial system contains five services.
+### Scenario
 
-## 1. Order Service
+Due to a consumer rebalance, network delay, or concurrent processing, two dispatch workers assign different drivers to the same order.
 
-Owns:
+### Symptoms
 
-* order lifecycle
-* order state machine
-* order consistency rules
+- Two `DriverAssigned` events exist for one order.
+- Both drivers travel to the restaurant.
+- One driver discovers the order has already been picked up.
+- Customer support receives a complaint.
 
-Responsibilities:
+### Root Cause
 
-* create orders
-* track order status
-* consume driver and dispatch events
-* publish order events
-* maintain order history
+Multiple consumers processed the same assignment request before the system reached a consistent state.
 
-Database:
+### Detection
 
-PostgreSQL
+- Duplicate assignment events detected.
+- Optimistic locking conflict on the Order aggregate.
+- Reconciliation job identifies conflicting assignments.
 
----
+### Resolution
 
-## 2. Dispatch Service
+- Enforce optimistic locking.
+- Use idempotent event consumers.
+- Prevent duplicate active assignments with database constraints.
+- Record the conflict as an Incident.
 
-Owns:
+### Prevention
 
-* driver assignment
-* reassignment decisions
-* assignment consistency
-
-Responsibilities:
-
-* assign available drivers
-* prevent duplicate assignments
-* publish assignment events
-* handle assignment failures
-
-Database:
-
-PostgreSQL
+- Concurrency integration tests.
+- Duplicate assignment metrics.
+- Continuous reconciliation jobs.
 
 ---
 
-## 3. Driver Service
+## Incident 2: Lost Kafka Event
 
-Owns:
+### Scenario
 
-* driver workflow
-* driver availability
-* arrival and pickup actions
+A consumer crashes after reading a `PickupConfirmed` event but before committing the offset.
 
-Responsibilities:
+### Symptoms
 
-* track driver status
-* publish location updates
-* report arrival
-* confirm pickup
-* report pickup conflicts
+- Driver successfully completes pickup.
+- Order remains in `ASSIGNED`.
+- Incident timeline is incomplete.
 
-Database:
+### Resolution
 
-PostgreSQL
+- Transactional Outbox Pattern.
+- Retry with exponential backoff.
+- Dead Letter Queue after retry exhaustion.
+- Reconciliation detects missing state transitions.
 
 ---
 
-## 4. Incident Service
+## Incident 3: Duplicate Event Delivery
 
-Owns delivery conflict cases.
+### Scenario
 
-This is the core domain introduced by this project.
+Kafka delivers the same event more than once.
 
-Responsibilities:
+### Symptoms
 
-* create incidents
-* collect evidence
-* maintain investigation timeline
-* track resolution status
-* connect events from multiple services
+- Multiple identical events arrive.
+- Without protection, downstream state becomes inconsistent.
 
-Example incident:
+### Resolution
+
+- Idempotent consumers.
+- `processed_events` table.
+- Ignore previously processed event IDs.
+
+---
+
+## Incident 4: Stuck Compensation Saga
+
+### Scenario
+
+Support approves compensation, but the Compensation Service is temporarily unavailable.
+
+### Symptoms
+
+- Incident remains in an intermediate state.
+- Compensation request is never completed.
+
+### Resolution
+
+- Saga retries.
+- Timeout detection.
+- Automatic recovery worker.
+- Manual intervention when retry limits are exceeded.
+
+---
+
+## Incident 5: Database and Kafka Inconsistency
+
+### Scenario
+
+Business data is committed successfully, but publishing the corresponding Kafka event fails.
+
+### Resolution
+
+- Transactional Outbox Pattern.
+- Background publisher continuously retries until the event is delivered.
+- No business transaction is lost.
+
+---
+
+## Incident 6: Out-of-Order Events
+
+### Scenario
+
+`PickupConfirmed` arrives before `DriverAssigned` because of network delays.
+
+### Resolution
+
+- Versioned aggregates.
+- Event ordering validation.
+- Temporary buffering when required.
+- Reconciliation corrects remaining inconsistencies.
+
+---
+
+## Incident 7: Pickup Conflict
+
+### Scenario
+
+Driver A is assigned the order, but Driver B completes the pickup.
+
+### Investigation Timeline
 
 ```
-Incident:
-INC-10001
+10:16 DriverAssigned (Driver A)
 
-Problem:
-Pickup Conflict
+10:23 DriverReassigned (Driver B)
 
-Driver:
-Driver A
+10:25 Driver B PickupConfirmed
 
-Evidence:
-- Driver assigned timestamp
-- Driver arrival timestamp
-- Pickup completed by another driver
-- Order event history
+10:27 Driver A Arrived
 
-Decision:
-Approved
-
-Compensation:
-Processed
-```
-
-Database:
-
-PostgreSQL
-
----
-
-## 5. Support and Compensation Service
-
-Owns human review workflow.
-
-Responsibilities:
-
-* review incidents
-* evaluate evidence
-* approve or reject compensation
-* trigger compensation workflow
-* close incidents
-
-Important:
-
-The system does not automatically decide compensation.
-
-It provides evidence and workflow support for human decisions.
-
-Database:
-
-PostgreSQL
-
----
-
-# 4. Event-Driven Architecture
-
-Apache Kafka is the communication backbone.
-
-Services communicate through events instead of direct database access.
-
-Example:
-
-```
-Order Service
-      |
-      |
-OrderCreated
-      |
-      v
-Kafka
-      |
-      |
-Dispatch Service
-
-      |
-      |
-DriverAssigned
-
-      |
-      |
-Driver Service
-
-      |
-      |
-PickupConflictReported
-
-      |
-      |
-Incident Service
-
-      |
-      |
-Support Review
-
-      |
-      |
-Compensation Processed
-```
-
----
-
-# 5. Core Domain Events
-
-## Order Events
-
-* OrderCreated
-* OrderAccepted
-* OrderReady
-* DriverAssignmentRequested
-* OrderCancelled
-* OrderClosed
-
-## Dispatch Events
-
-* DriverAssigned
-* DriverReassigned
-* AssignmentFailed
-* DuplicateAssignmentDetected
-
-## Driver Events
-
-* DriverEnRoute
-* DriverArrived
-* PickupConfirmed
-* PickupConflictReported
-* DriverOffline
-
-## Incident Events
-
-* IncidentCreated
-* EvidenceCollected
-* InvestigationStarted
-* CompensationRequested
-* CompensationApproved
-* CompensationRejected
-* IncidentClosed
-
----
-
-# 6. Incident Resolution Workflow
-
-The main saga:
-
-```
-PickupConflictReported
-
-        |
-
-IncidentCreated
-
-        |
-
-EvidenceCollected
-
-        |
-
-InvestigationStarted
-
-        |
-
-SupportDecisionMade
-
-        |
-
-CompensationRequested
-
-        |
-
-CompensationProcessed
-
-        |
-
-IncidentClosed
-```
-
-This models a real operational workflow where technical state and human decisions interact.
-
----
-
-# 7. Event Timeline and Audit
-
-A major requirement is reconstructing what happened.
-
-Example:
-
-```
-10:01 OrderCreated
-
-10:15 RestaurantReady
-
-10:16 DriverAssigned
-
-10:25 DriverArrived
-
-10:26 AnotherDriverPickupConfirmed
-
-10:27 PickupConflictReported
+10:28 PickupConflictReported
 
 10:35 InvestigationStarted
 
 10:45 CompensationApproved
-
-10:50 IncidentClosed
 ```
 
-Every event contains:
+### Resolution
 
-* eventId
-* eventType
-* aggregateId
-* timestamp
-* correlationId
-* causationId
-* version
-* payload
+The Incident Service reconstructs the event timeline using:
 
-This allows distributed debugging and audit.
+- correlationId
+- causationId
+- aggregateId
+- timestamps
+- event history
+
+Support reviews the evidence and determines whether compensation is appropriate.
 
 ---
 
-# 8. Reconciliation Service
+# Reliability Objectives
 
-Large distributed systems cannot rely only on real-time events.
-
-A reconciliation process periodically detects inconsistencies.
-
-Examples:
-
-```
-Driver A assigned
-
-BUT
-
-Driver B completed pickup
-```
-
-or:
-
-```
-Order status:
-ASSIGNED
-
-Pickup event:
-COMPLETED
-```
-
-The reconciliation service:
-
-* compares system states
-* detects anomalies
-* creates incidents automatically
-* triggers investigation workflows
+| Category | Goal |
+|-----------|------|
+| Availability | 99.9% |
+| Event Delivery | At-least-once |
+| Consistency | Eventual Consistency |
+| Recovery | Automatic where possible |
+| Observability | OpenTelemetry + Prometheus + Grafana |
+| Auditability | Complete event timeline reconstruction |
 
 ---
 
-# 9. Reliability Patterns
+# Failure Injection & Chaos Testing
 
-## Transactional Outbox
+The platform intentionally injects failures to validate system resilience.
 
-Each service writes:
+Planned failure scenarios include:
 
-1. business state change
-2. event record
+- Kafka consumer crashes
+- Duplicate event delivery
+- Network partitions
+- Out-of-order events
+- Database failures
+- Service restarts
+- Retry exhaustion
+- Dead Letter Queue processing
+- Optimistic locking conflicts
+- Long-running Saga recovery
 
-in the same database transaction.
-
-Example:
-
-```
-Order updated
-
-+
-
-OrderCreated event stored
-
-=
-
-Database transaction committed
-```
-
-Then the publisher sends the event to Kafka.
-
----
-
-## Idempotency
-
-Duplicate events are expected.
-
-Each consumer stores:
-
-```
-processed_events
-
-event_id
-processed_time
-```
-
-Repeated events are ignored safely.
-
----
-
-## Optimistic Locking
-
-Entities contain version numbers.
-
-Example:
-
-```
-Order version = 5
-
-Update allowed only if version = 5
-```
-
-Prevents lost updates during concurrent changes.
-
----
-
-# 10. Project Development Plan
-
-## Phase 1
-
-Build:
-
-* Order Service
-* Kafka integration
-* PostgreSQL
-* Flyway migrations
-* Outbox Pattern
-* State machine
-* Integration tests
-
-## Phase 2
-
-Build:
-
-* Dispatch Service
-* Driver assignment workflow
-* Duplicate assignment prevention
-
-## Phase 3
-
-Build:
-
-* Driver Service
-* Pickup conflict detection
-
-## Phase 4
-
-Build:
-
-* Incident Service
-* Support workflow
-* Compensation saga
-
-## Phase 5
-
-Add:
-
-* Reconciliation
-* OpenTelemetry
-* Prometheus
-* Grafana
-* Kubernetes deployment
-
----
-
-# Project Goal
-
-This project demonstrates how modern backend systems handle failures caused by distributed execution.
-
-The focus is not only making transactions succeed.
-
-The focus is:
-
-* detecting failures,
-* understanding what happened,
-* recovering safely,
-* compensating affected users,
-* maintaining consistency across distributed services.
+Each scenario is verified through automated integration tests using Testcontainers and production-like environments.
